@@ -90,7 +90,7 @@ static struct k_thread red_thread;
 static struct k_thread green_thread;
 
 void main(void) {
-	int noturno = 1;
+	int noturno = 0;
 
     // Verifica se os devices estão prontos
     if (!gpio_is_ready_dt(&led_red) || !gpio_is_ready_dt(&led_green)) {

@@ -2,6 +2,29 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 
+//Botão na porta PTA16
+#define PORTA_NODE DT_NODELABEL(gpioa)
+static const struct gpio_dt_spec button = {
+	.port = DEVICE_DT_GET(PORTA_NODE),
+	.pin = 16,
+	.dt_flags = GPIO_ACTIVE_LOW, //botão ativo em nível baixo
+};
+static struct gpio_callback button_cb_data;
+
+//ISR - chamada quando o botão é pressionado
+void button_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+	static int64_t last_press_time = 0;
+	int64_t now = k_uptime_get();
+
+	//Ignora rebotes menores que 200 ms
+	if (now - last_press_time < 200) {
+		return;
+	}
+
+	last_press_time = now;
+	printk("botao pressionado!\n");
+}
+
 //Mutex para controle dos LEDs
 struct k_mutex semaforo_mutex;
 
@@ -97,7 +120,15 @@ void main(void) {
         printk("Error: LED devices is not ready\n");
         return;
     }
+	if (!device_is_ready(button.port)) {
+		printk("Erro: GPIOA is not ready\n");
+	}
 
+	gpio_pin_configure(button.port, button.pin, GPIO_INPUT | GPIO_PULL_UP);
+	gpio_pin_interrupt_configure(button.port, button.pin, GPIO_INT_EDGE_TO_INACTIVE); // borda de descida (pressionar)~
+	gpio_init_callback(&button_cb_data, button_isr, BIT(button.pin));
+	gpio_add_callback(button.port, &button_cb_data);
+	
     gpio_pin_configure_dt(&led_red, GPIO_OUTPUT_ACTIVE);
 	if(!noturno) {
 		gpio_pin_configure_dt(&led_green, GPIO_OUTPUT_ACTIVE);

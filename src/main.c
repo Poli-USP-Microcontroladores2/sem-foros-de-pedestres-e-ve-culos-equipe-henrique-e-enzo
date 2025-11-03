@@ -87,7 +87,7 @@ void thread_led_vermelho(void *arg1, void *arg2, void *arg3) {
 }
 
 void thread_modo_noturno(void *arg1, void *arg2, void *arg3) {
-    k_sem_take(&sem_verde, K_FOREVER);
+    k_sem_take(&sem_modo_noturno, K_FOREVER);
     
     k_mutex_lock(&mutex_leds, K_FOREVER);
      

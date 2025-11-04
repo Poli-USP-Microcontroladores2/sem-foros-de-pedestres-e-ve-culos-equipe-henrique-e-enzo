@@ -11,17 +11,26 @@ static const struct gpio_dt_spec button = {
 };
 static struct gpio_callback button_cb_data;
 
+// GPIO para sinal de sincronização - PTB1
+#define PORTB_NODE DT_NODELABEL(gpiob)
+static const struct gpio_dt_spec sync_signal = {
+    .port = DEVICE_DT_GET(PORTB_NODE),
+    .pin = 1,
+};
+
 // Mutex para controle de LEDs e semaforo para o botao de travessia
 struct k_mutex leds_mutex;
 struct k_sem   ped_request_sem;
 struct k_sem   cycle_sem;
 
 // Threads
-k_tid_t tid_red, tid_green;
+k_tid_t tid_red, tid_green, tid_noturno;
 K_THREAD_STACK_DEFINE(red_stack, 1024);
 K_THREAD_STACK_DEFINE(green_stack, 1024);
+K_THREAD_STACK_DEFINE(noturno_stack, 1024);
 static struct k_thread red_thread;
 static struct k_thread green_thread;
+static struct k_thread noturno_thread;
 
 // LEDs
 #define TEMPO_DO_LED_VERDE_MS    		4000
@@ -42,6 +51,29 @@ typedef enum {
 
 volatile estado_semaforo_t estado_atual = VERMELHO;
 volatile bool pedestre_esperando = false;
+volatile bool modo_noturno_ativo = false;
+
+// Função para enviar sinal de sincronização
+void enviar_sinal_sincronizacao(void) {
+    if (modo_noturno_ativo) return;
+    
+    // Pulso de sincronização - 100ms HIGH
+    gpio_pin_set_dt(&sync_signal, 1);
+    k_msleep(100);
+    gpio_pin_set_dt(&sync_signal, 0);
+    printk("Sinal de sincronização enviado\n");
+}
+
+// Função para enviar sinal de travessia
+void enviar_sinal_travessia(void) {
+    if (modo_noturno_ativo) return;
+    
+    // Pulso de travessia - 500ms HIGH
+    gpio_pin_set_dt(&sync_signal, 1);
+    k_msleep(500);
+    gpio_pin_set_dt(&sync_signal, 0);
+    printk("Sinal de travessia enviado\n");
+}
 
 // ISR - botão
 void button_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
@@ -52,9 +84,16 @@ void button_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pin
     last_press_time = now;
     
     printk("Botão pressionado\n");
+    if (modo_noturno_ativo) {
+        printk("Modo noturno ativo - botão ignorado\n");
+        return;
+    }
+    
     if (estado_atual == VERMELHO) {
         pedestre_esperando = true;
         k_sem_give(&ped_request_sem);
+        // Envia sinal de travessia para semáforo de veículos
+        enviar_sinal_travessia();
     }
 }
 
@@ -69,6 +108,11 @@ void set_leds(bool red_on, bool green_on) {
 // THREAD - LED verde
 void fn_thread_led_verde(void *p1, void *p2, void *p3) {
     while(1) {
+        if (modo_noturno_ativo) {
+            k_msleep(100);
+            continue;
+        }
+        
         // Espera pelo sinal para iniciar ciclo verde
         k_sem_take(&cycle_sem, K_FOREVER);
         
@@ -92,6 +136,11 @@ void fn_thread_led_verde(void *p1, void *p2, void *p3) {
 // THREAD - LED vermelho
 void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
     while(1) {
+        if (modo_noturno_ativo) {
+            k_msleep(100);
+            continue;
+        }
+        
         // Estado vermelho
         estado_atual = VERMELHO;
         pedestre_esperando = false;
@@ -104,6 +153,8 @@ void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
         
         // Espera 2 segundos OU pedido antecipado
         while (espera < TEMPO_DO_LED_VERMELHO_MS) {
+            if (modo_noturno_ativo) break;
+            
             // Verifica se há pedido de travessia a cada 100ms
             if (pedestre_esperando) {
                 printk("Transição antecipada para verde\n");
@@ -114,6 +165,8 @@ void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
             espera += 100;
         }
         
+        if (modo_noturno_ativo) continue;
+        
         if (!travessia_antecipada) {
             printk("Tempo vermelho completo - transição normal\n");
         }
@@ -121,6 +174,9 @@ void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
         // Desliga vermelho
         set_leds(false, false);
         k_msleep(200); // Pequena pausa entre transições
+        
+        // Envia sinal de sincronização antes de iniciar ciclo verde
+        enviar_sinal_sincronizacao();
         
         // Inicia ciclo verde
         k_sem_give(&cycle_sem);
@@ -136,6 +192,11 @@ void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
 // Modo noturno - pisca vermelho
 void fn_thread_led_noturno(void *p1, void *p2, void *p3) {
     while(1) {
+        if (!modo_noturno_ativo) {
+            k_msleep(100);
+            continue;
+        }
+        
         set_leds(true, false);
         k_msleep(TEMPO_DO_PISCA_LED_VERMELHO_MS);
         set_leds(false, false);
@@ -143,10 +204,31 @@ void fn_thread_led_noturno(void *p1, void *p2, void *p3) {
     }
 }
 
+// Função para ativar/desativar modo noturno
+void toggle_modo_noturno(void) {
+    modo_noturno_ativo = !modo_noturno_ativo;
+    
+    if (modo_noturno_ativo) {
+        printk("=== MODO NOTURNO ATIVADO ===\n");
+        // Desliga todos os LEDs primeiro
+        set_leds(false, false);
+        // Inicia thread do modo noturno se não estiver rodando
+        if (tid_noturno == NULL) {
+            tid_noturno = k_thread_create(&noturno_thread, noturno_stack, 
+                K_THREAD_STACK_SIZEOF(noturno_stack), fn_thread_led_noturno, 
+                NULL, NULL, NULL, 5, 0, K_NO_WAIT);
+        }
+    } else {
+        printk("=== MODO NORMAL ATIVADO ===\n");
+        // Desliga todos os LEDs
+        set_leds(false, false);
+    }
+}
+
 void main(void) {
     int noturno = 0; // Mude para 1 para modo noturno
 
-    printk("Iniciando semáforo com ciclo automático...\n");
+    printk("Iniciando semáforo de pedestres...\n");
 
     // Verifica devices
     if (!gpio_is_ready_dt(&led_red) || !gpio_is_ready_dt(&led_green)) {
@@ -159,8 +241,20 @@ void main(void) {
         return;
     }
 
+    // Configura GPIO de sincronização como saída
+    if (!device_is_ready(sync_signal.port)) {
+        printk("Erro: GPIOB não está pronto\n");
+        return;
+    }
+    
+    int ret = gpio_pin_configure_dt(&sync_signal, GPIO_OUTPUT_INACTIVE);
+    if (ret != 0) {
+        printk("Erro configurando sinal de sincronização: %d\n", ret);
+        return;
+    }
+
     // Configura botão
-    int ret = gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
+    ret = gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
     if (ret != 0) {
         printk("Erro configurando botão: %d\n", ret);
         return;
@@ -196,11 +290,9 @@ void main(void) {
     // Garante LEDs inicialmente desligados
     set_leds(false, false);
 
+    // Configura modo noturno baseado na variável
     if (noturno == 1) {
-        printk("Modo noturno ativado\n");
-        tid_red = k_thread_create(&red_thread, red_stack, 
-            K_THREAD_STACK_SIZEOF(red_stack), fn_thread_led_noturno, 
-            NULL, NULL, NULL, 5, 0, K_NO_WAIT);
+        toggle_modo_noturno();
     } else {
         printk("Modo normal ativado - Ciclo: 2s Vermelho -> 4s Verde\n");
         
@@ -216,10 +308,16 @@ void main(void) {
             NULL, NULL, NULL, 5, 0, K_NO_WAIT);
     }
 
-    printk("Sistema iniciado\n");
+    printk("Sistema iniciado - PTB1 configurado como saída\n");
+    printk("Modo noturno: %s\n", noturno ? "ATIVADO" : "DESATIVADO");
 
-    // Loop principal
+    // Loop principal com controle de modo noturno
     while (1) {
-        k_msleep(1000);
+        // Aqui você pode adicionar lógica para alternar modo noturno
+        // Por exemplo, baseado em horário ou outro sensor
+        k_msleep(10000); // Verifica a cada 10 segundos
+        
+        // Exemplo: alternar modo noturno automaticamente (remova se não quiser)
+        // toggle_modo_noturno();
     }
 }

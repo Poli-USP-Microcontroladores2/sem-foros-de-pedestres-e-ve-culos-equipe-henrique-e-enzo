@@ -1,6 +1,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(semaforo_veiculos, LOG_LEVEL_INF);
 
 K_SEM_DEFINE(sem_verde, 1, 1);   
 K_SEM_DEFINE(sem_amarelo, 0, 1);  
@@ -10,6 +13,11 @@ K_MUTEX_DEFINE(mutex_leds);
 
 K_SEM_DEFINE(sem_modo_noturno, 0, 1);
 bool modo_noturno = false;
+
+// --- NOVO: Semáforo para a ISR acordar a thread de processamento ---
+K_SEM_DEFINE(sem_sync_isr, 0, 1);
+volatile bool recebeu_sincronizacao = false;
+volatile bool recebeu_travessia = false;
 
 // Define o LED usando Device Tree
 #define LED0_NODE DT_ALIAS(led0)
@@ -35,64 +43,114 @@ static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(LED2_NODE, gpios);
 #error "Unsupported board: led0 devicetree alias is not defined"
 #endif
 
+// GPIO para receber sinal de sincronização - PTA5
+#define PORTA_NODE DT_NODELABEL(gpioa)
+static const struct gpio_dt_spec sync_input = {
+    .port = DEVICE_DT_GET(PORTA_NODE),
+    .pin = 5,
+};
+static struct gpio_callback sync_cb_data;
+
+// Esta função é chamada pela interrupção. Rápida, sem 'sleeps', sem 'prints'.
+void sync_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    // Apenas acorda a thread de processamento. NADA MAIS.
+    k_sem_give(&sem_sync_isr);
+}
+
 void thread_led_verde(void *arg1, void *arg2, void *arg3) {
     while (!modo_noturno) {
         k_sem_take(&sem_verde, K_FOREVER);
+        LOG_INF("Pegou sem_verde");
+
+        // Verifica se recebeu sinal de travessia (da ISR)
+        if (recebeu_travessia) {
+            recebeu_travessia = false; // "Consome" a flag
+            LOG_INF("Verde: Travessia pedida, pulando para amarelo");
+            k_sem_give(&sem_amarelo);
+            continue; // Pula o resto do estado verde
+        }
 
         k_mutex_lock(&mutex_leds, K_FOREVER);
 
         gpio_pin_set_dt(&led2, 0);
         gpio_pin_set_dt(&led0, 1);
+        LOG_INF("Ligou Led Verde");
 
         k_mutex_unlock(&mutex_leds);
 
         k_msleep(3000);
         
         k_sem_give(&sem_amarelo);
+        LOG_INF("Deu sem_amarelo");
     }
 }
 
 void thread_led_amarelo(void *arg1, void *arg2, void *arg3) {
     while (!modo_noturno) {
         k_sem_take(&sem_amarelo, K_FOREVER);
+        LOG_INF("Pegou sem_amarelo");
         
         k_mutex_lock(&mutex_leds, K_FOREVER);
 
         gpio_pin_set_dt(&led0, 1);
         gpio_pin_set_dt(&led2, 1);
+        LOG_INF("Ligou Led Amarelo");
 
         k_mutex_unlock(&mutex_leds);
 
         k_msleep(1000);
 
         k_sem_give(&sem_vermelho);
+        LOG_INF("Deu sem_vermelho");
     }
 }
 
 void thread_led_vermelho(void *arg1, void *arg2, void *arg3) {
     while (!modo_noturno) {
         k_sem_take(&sem_vermelho, K_FOREVER);
+        LOG_INF("Pegou sem_vermelho");
 
         k_mutex_lock(&mutex_leds, K_FOREVER);
         
         gpio_pin_set_dt(&led0, 0);
         gpio_pin_set_dt(&led2, 1);
+        LOG_INF("Ligou Led Vermelho");
 
         k_mutex_unlock(&mutex_leds);
 
-        k_msleep(4000);
+        // Lógica de espera: 4s OU até receber sinal de sync do pedestre
+        int espera = 0;
+        while (espera < 4000 && !recebeu_sincronizacao) {
+            if (modo_noturno) break;
+            k_msleep(100);
+            espera += 100;
+        }
+        
+        if (recebeu_sincronizacao) {
+            recebeu_sincronizacao = false; // "Consome" a flag
+            LOG_INF("Vermelho: Sincronizado com pedestre! (esperou %d ms)", espera);
+        } else {
+            LOG_INF("Vermelho: Timeout de 4s atingido (sem sync)");
+        }
+        
+        // Se pedestre pediu travessia (pulso longo) DURANTE o vermelho, 
+        // ele será tratado no próximo ciclo verde.
+        recebeu_travessia = false; // Limpa a flag por segurança
 
         k_sem_give(&sem_verde);
+        LOG_INF("Deu sem_verde");
     }
 }
 
 void thread_modo_noturno(void *arg1, void *arg2, void *arg3) {
     k_sem_take(&sem_modo_noturno, K_FOREVER);
+    LOG_INF("Pegou sem_modo_noturno");
     
     k_mutex_lock(&mutex_leds, K_FOREVER);
      
     gpio_pin_set_dt(&led0, 0);
     gpio_pin_set_dt(&led2, 0);
+    LOG_INF("Desligou Leds ativos");
 
     k_mutex_unlock(&mutex_leds);
 
@@ -101,9 +159,51 @@ void thread_modo_noturno(void *arg1, void *arg2, void *arg3) {
         
         gpio_pin_toggle_dt(&led0);
         gpio_pin_toggle_dt(&led2);
+        LOG_INF("Ligou/Desligou Led Amarelo");
 
         k_mutex_unlock(&mutex_leds);
         k_msleep(1000);
+    }
+}
+
+// --- NOVO: Thread "Processadora" da ISR ---
+// Esta thread faz o trabalho pesado que a ISR não pode fazer.
+void thread_processa_sync(void *arg1, void *arg2, void *arg3) {
+    static int64_t last_sync_time = 0; // Para debounce
+
+    while (1) {
+        // 1. Dorme até a ISR (sync_isr) acordá-la
+        k_sem_take(&sem_sync_isr, K_FOREVER);
+
+        if (modo_noturno) {
+            continue; // Ignora sinais se estiver em modo noturno
+        }
+
+        // 2. A thread (NÃO a ISR) faz o trabalho
+        int64_t now = k_uptime_get();
+        int state = gpio_pin_get_dt(&sync_input);
+
+        // A ISR foi configurada para 'EDGE_TO_HIGH', então só precisamos checar state == 1
+        if (state == 1) { 
+            // Agora SIM pode dormir para checar a duração do pulso
+            k_msleep(10); // Pausa para diferenciar pulso curto de longo
+            state = gpio_pin_get_dt(&sync_input);
+
+            if (state == 1) {
+                // Pulso ainda está alto = Pulso Longo = Travessia de Pedestre
+                recebeu_travessia = true;
+                LOG_INF("ISR_Handler: Sinal de TRAVESSIA recebido");
+            } else {
+                // Pulso já caiu = Pulso Curto = Sincronização
+                if (now - last_sync_time > 1000) { // Debounce de 1s
+                    recebeu_sincronizacao = true;
+                    LOG_INF("ISR_Handler: Sinal de SINCRONIZAÇÃO recebido");
+                    last_sync_time = now;
+                }
+            }
+        }
+        // Se state == 0 (borda de descida), nós ignoramos, 
+        // pois a 'k_msleep(10)' já tratou a borda de descida do pulso curto.
     }
 }
 
@@ -119,6 +219,11 @@ K_THREAD_DEFINE(t_led_vermelho, 512, thread_led_vermelho,
 K_THREAD_DEFINE(t_modo_noturno, 512, thread_modo_noturno,
                 NULL, NULL, NULL,
                 7, 0, 0);
+// --- NOVO: Definição da thread processadora da ISR ---
+// Prioridade 5 (mais alta que os LEDs) para processar o sinal rápido
+K_THREAD_DEFINE(t_processa_sync, 512, thread_processa_sync,
+                NULL, NULL, NULL,
+                5, 0, 0);
 
 void main(void)
 {
@@ -137,6 +242,33 @@ void main(void)
         printk("Error: LED device %s is not ready\n", led2.port->name);
         return;
     }
+
+    // --- NOVO: Configuração completa do pino de entrada e ISR ---
+    LOG_INF("Configurando pino de entrada sync (PTA5)...");
+    if (!device_is_ready(sync_input.port)) {
+        printk("Error: GPIOA (sync_input) não está pronto\n");
+        return;
+    }
+    
+    // Configura pino como Entrada com PULL_DOWN
+    int ret_sync = gpio_pin_configure_dt(&sync_input, (GPIO_INPUT | GPIO_PULL_DOWN));
+    if (ret_sync != 0) {
+        printk("Erro %d configurando entrada de sincronização\n", ret_sync);
+        return;
+    }
+    
+    // Configura interrupção para Borda de SUBIDA (quando o sinal vai de 0 para 1)
+    ret_sync = gpio_pin_interrupt_configure_dt(&sync_input, GPIO_INT_EDGE_RISING);
+    if (ret_sync != 0) {
+        printk("Erro %d configurando interrupção de sync\n", ret_sync);
+        return;
+    }
+    
+    // Registra o callback (sync_isr)
+    gpio_init_callback(&sync_cb_data, sync_isr, BIT(sync_input.pin));
+    gpio_add_callback(sync_input.port, &sync_cb_data);
+    LOG_INF("ISR de Sincronização configurada em PTA5.");
+    // --- FIM DA ADIÇÃO DA ISR ---
 
     // Configura o pino como saída
     ret0 = gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);

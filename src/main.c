@@ -172,7 +172,7 @@ void thread_processa_sync(void *arg1, void *arg2, void *arg3) {
     static int64_t last_sync_time = 0; // Para debounce
 
     while (1) {
-        // 1. Dorme até a ISR (sync_isr) acordá-la
+        // 1. Dorme até a ISR (sync_isr) acordá-la (na borda de SUBIDA)
         k_sem_take(&sem_sync_isr, K_FOREVER);
 
         if (modo_noturno) {
@@ -181,29 +181,44 @@ void thread_processa_sync(void *arg1, void *arg2, void *arg3) {
 
         // 2. A thread (NÃO a ISR) faz o trabalho
         int64_t now = k_uptime_get();
+
+        // 3. Debounce: Ignora gatilhos por 200ms após o último gatilho
+        //    (Evita ruído elétrico na borda de subida)
+        if (now - last_sync_time < 200) {
+            LOG_WRN("ISR_Handler: Debounce (200ms), ignorando pulso.");
+            continue;
+        }
+        last_sync_time = now; // Registra o início deste pulso
+
+        // O pino ACABOU de subir (estado 1).
+        
+        // 4. Esperamos 250ms. Este é o tempo "intermediário".
+        //    (100ms < 250ms < 500ms)
+        
+        k_msleep(250); // <--- A lógica de decisão foi movida para cá.
+
         int state = gpio_pin_get_dt(&sync_input);
 
-        // A ISR foi configurada para 'EDGE_TO_HIGH', então só precisamos checar state == 1
-        if (state == 1) { 
-            // Agora SIM pode dormir para checar a duração do pulso
-            k_msleep(10); // Pausa para diferenciar pulso curto de longo
-            state = gpio_pin_get_dt(&sync_input);
+        if (state == 1) {
+            // Se ainda está ALTO depois de 250ms = Pulso Longo (500ms)
+            recebeu_travessia = true;
+            LOG_INF("ISR_Handler: Sinal de TRAVESSIA (longo) recebido");
 
-            if (state == 1) {
-                // Pulso ainda está alto = Pulso Longo = Travessia de Pedestre
-                recebeu_travessia = true;
-                LOG_INF("ISR_Handler: Sinal de TRAVESSIA recebido");
-            } else {
-                // Pulso já caiu = Pulso Curto = Sincronização
-                if (now - last_sync_time > 1000) { // Debounce de 1s
-                    recebeu_sincronizacao = true;
-                    LOG_INF("ISR_Handler: Sinal de SINCRONIZAÇÃO recebido");
-                    last_sync_time = now;
-                }
+            // Bônus: Esperar o pulso terminar para limpar a linha
+            // e atualizar o 'last_sync_time' para o *fim* do pulso.
+            int64_t start_wait = k_uptime_get();
+            while (gpio_pin_get_dt(&sync_input) == 1 && (k_uptime_get() - start_wait < 1000)) {
+                k_msleep(20);
             }
+            // Atualiza o debounce para o FIM do pulso longo
+            last_sync_time = k_uptime_get(); 
+
+        } else {
+            // Se já está BAIXO depois de 250ms = Pulso Curto (100ms)
+            recebeu_sincronizacao = true;
+            LOG_INF("ISR_Handler: Sinal de SINCRONIZAÇÃO (curto) recebido");
+            // O 'last_sync_time' (do início) já garante o debounce
         }
-        // Se state == 0 (borda de descida), nós ignoramos, 
-        // pois a 'k_msleep(10)' já tratou a borda de descida do pulso curto.
     }
 }
 

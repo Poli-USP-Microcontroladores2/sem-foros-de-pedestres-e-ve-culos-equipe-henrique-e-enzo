@@ -53,6 +53,9 @@ volatile estado_semaforo_t estado_atual = VERMELHO;
 volatile bool pedestre_esperando = false;
 volatile bool modo_noturno_ativo = false;
 
+/* Timestamp quando ped_request foi gerado (usado para prioridade/ordem) */
+volatile int64_t ped_request_ts = 0;
+
 // --- Funções de sincronização ---
 void enviar_sinal_sincronizacao(void) {
     if (modo_noturno_ativo) return;
@@ -81,6 +84,8 @@ void button_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pin
     if (modo_noturno_ativo) return;
 
     pedestre_esperando = true;
+    /* marca timestamp local — útil se quiser depurar ordem no outro equipamento */
+    ped_request_ts = k_uptime_get();
     k_sem_give(&ped_request_sem);  // acorda thread vermelha
 }
 
@@ -104,7 +109,20 @@ void fn_thread_led_verde(void *p1, void *p2, void *p3) {
         estado_atual = VERDE;
         printk(">>> VERDE LIGADO - 4s\n");
         set_leds(false, true);
-        k_msleep(TEMPO_DO_LED_VERDE_MS);
+
+        /* registra início do verde para comparar com ped_request_ts do botão */
+        int64_t green_start = k_uptime_get();
+
+        int waited = 0;
+        while (waited < TEMPO_DO_LED_VERDE_MS) {
+            /* se pedestre pressionou DURANTE este verde (timestamp posterior ao green start) -> interrompe */
+            if (pedestre_esperando && (ped_request_ts >= green_start)) {
+                printk(">>> VERDE interrompido por pedido de travessia (durante verde)\n");
+                break;
+            }
+            k_msleep(100);
+            waited += 100;
+        }
 
         printk(">>> VERDE DESLIGADO\n");
         set_leds(false, false);
@@ -123,28 +141,42 @@ void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
         }
 
         estado_atual = VERMELHO;
-        pedestre_esperando = false;
 
         printk(">>> VERMELHO LIGADO\n");
         set_leds(true, false);
 
         int espera = 0;
+        bool pedido_detectado_durante_vermelho = false;
+
+        /* Monitora se pedestre pediu durante o vermelho */
         while (espera < TEMPO_DO_LED_VERMELHO_MS) {
             if (modo_noturno_ativo) break;
-            if (pedestre_esperando) break;
+            if (pedestre_esperando) {
+                /* marca que o pedido aconteceu DURANTE este vermelho */
+                pedido_detectado_durante_vermelho = true;
+                /* NÃO zera pedestre_esperando aqui — quem consome será o final deste fluxo */
+                break;
+            }
             k_msleep(100);
             espera += 100;
         }
 
-        if (pedestre_esperando) {
-            printk(">>> Pedido de travessia recebido\n");
-            pedestre_esperando = false;
-            enviar_sinal_travessia(); // envia pulso longo
-            k_msleep(1000);
+        if (pedido_detectado_durante_vermelho) {
+            printk(">>> Pedido de travessia recebido durante VERMELHO - enviando travessia (se necessário)\n");
+            /* envia pulso de travessia (caso pedestre local precise avisar) */
+            enviar_sinal_travessia();
+            /* aguarda o tempo de travessia do pedestre terminar; o pedestre envia um pulso curto ao final
+               (o semáforo de pedestres já faz isso). Aqui, aguardamos o curto (sincronização) na outra placa. */
+            /* Para garantir interoperabilidade, apenas aguardamos um pequeno intervalo extra (a outra ponta enviará o curto). */
+            k_msleep(1000); // mantém vermelho enquanto travessia acontece
         }
 
         set_leds(false, false);
-        enviar_sinal_sincronizacao(); // envia pulso curto
+
+        /* envia sinal curto de sincronização para a placa veicular indicando fim do ciclo pedestre */
+        enviar_sinal_sincronizacao();
+
+        /* agora libera ciclo verde (a placa veicular decidirá se avança ou não, é responsável por prioridade) */
         k_sem_give(&cycle_sem);       // ativa ciclo verde
         k_sem_take(&cycle_sem, K_FOREVER);
     }
@@ -237,6 +269,8 @@ void main(void) {
     }
 
     printk("Sistema iniciado - PTB1 como saída de sincronismo\n");
+
+    enviar_sinal_travessia(); //POG para bootar o semaforo
 
     while (1) {
         k_msleep(10000);

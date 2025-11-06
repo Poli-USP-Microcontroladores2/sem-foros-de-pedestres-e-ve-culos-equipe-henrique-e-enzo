@@ -22,6 +22,9 @@ volatile int64_t sync_timestamp_ms = 0; /* pulso curto -> marca quando ocorreu *
 /* proteção das flags */
 K_MUTEX_DEFINE(flags_mutex);
 
+bool modo_noturno = false;
+K_SEM_DEFINE(sem_modo_noturno, 0, 1);
+
 /* DT LED aliases (ajuste se sua placa usar outros aliases) */
 #define LED0_NODE DT_ALIAS(led0)
 #define LED1_NODE DT_ALIAS(led1)
@@ -56,6 +59,7 @@ K_SEM_DEFINE(sem_sync_isr, 0, 1);
 void sync_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
     k_sem_give(&sem_sync_isr);
+    LOG_INF("Forneceu sem_sync_isr");
 }
 
 void thread_processa_sync(void *a, void *b, void *c)
@@ -66,6 +70,7 @@ void thread_processa_sync(void *a, void *b, void *c)
 
     while (1) {
         k_sem_take(&sem_sync_isr, K_FOREVER);
+        LOG_INF("Thread processa consome sem_sync_isr");
         int64_t now = k_uptime_get();
 
         if (now - last_pulse < 200) continue;
@@ -87,15 +92,19 @@ void thread_processa_sync(void *a, void *b, void *c)
             LOG_INF("Pulso ignorado (ruído) %d ms", dur);
         } else if (dur >= 300) {
             k_mutex_lock(&flags_mutex, K_FOREVER);
+            LOG_INF("Pega flags_mutex");
             ped_request = true;
             ped_request_ts = k_uptime_get();
             k_mutex_unlock(&flags_mutex);
-            LOG_INF("Pulso LONGO detectado (%d ms) -> ped_request=TRUE ts=%lld", dur, ped_request_ts);
+            LOG_INF("Libera flags_mutex");
+            LOG_WRN("Pulso LONGO detectado (%d ms) -> ped_request=TRUE ts=%lld", dur, ped_request_ts);
         } else {
             k_mutex_lock(&flags_mutex, K_FOREVER);
+            LOG_INF("Pega flags_mutex");
             sync_timestamp_ms = k_uptime_get();
             k_mutex_unlock(&flags_mutex);
-            LOG_INF("Pulso CURTO detectado (%d ms) -> sync_timestamp_ms=%lld", dur, sync_timestamp_ms);
+            LOG_INF("Libera flags_mutex");
+            LOG_WRN("Pulso CURTO detectado (%d ms) -> sync_timestamp_ms=%lld", dur, sync_timestamp_ms);
         }
 
         last_pulse = k_uptime_get();
@@ -115,8 +124,9 @@ void thread_led_verde(void *a, void *b, void *c)
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
     const int GREEN_MS = 3000;
 
-    while (1) {
+    while (!modo_noturno) {
         k_sem_take(&sem_verde, K_FOREVER);
+        LOG_INF("Tread led verde consome sem_verde");
         gpio_pin_set_dt(&led0, 1);
         LOG_INF("GREEN ON");
 
@@ -127,9 +137,11 @@ void thread_led_verde(void *a, void *b, void *c)
 
         while (elapsed < GREEN_MS) {
             k_mutex_lock(&flags_mutex, K_FOREVER);
+            LOG_INF("Thread led verde pega flags_mutex");
             bool pr = ped_request;
             int64_t pr_ts = ped_request_ts;
             k_mutex_unlock(&flags_mutex);
+            LOG_INF("Thread led verde libera flags_mutex");
 
             /* só interrompe se o pedido veio DEPOIS do início do GREEN */
             if (pr && pr_ts >= green_start) {
@@ -144,8 +156,11 @@ void thread_led_verde(void *a, void *b, void *c)
         LOG_INF("GREEN OFF");
 
         k_mutex_lock(&transition_mutex, K_FOREVER);
+        LOG_INF("Thread led verde pega transition_mutex");
         k_sem_give(&sem_amarelo);
+        LOG_INF("Thread led verde fornece sem_amarelo");
         k_mutex_unlock(&transition_mutex);
+        LOG_INF("Thread led verde libera transition_mutex");
     }
 }
 
@@ -155,8 +170,9 @@ void thread_led_amarelo(void *a, void *b, void *c)
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
     const int YELLOW_MS = 1000;
 
-    while (1) {
+    while (!modo_noturno) {
         k_sem_take(&sem_amarelo, K_FOREVER);
+        LOG_INF("Thread led amarelo consome sem_amarelo");
 
         gpio_pin_set_dt(&led2, 1);
         gpio_pin_set_dt(&led0, 1);
@@ -167,8 +183,11 @@ void thread_led_amarelo(void *a, void *b, void *c)
         LOG_INF("YELLOW OFF");
 
         k_mutex_lock(&transition_mutex, K_FOREVER);
+        LOG_INF("Thread led amarelo pega transition_mutex");
         k_sem_give(&sem_vermelho);
+        LOG_INF("Thread led amarelo fornece sem_vermelho");
         k_mutex_unlock(&transition_mutex);
+        LOG_INF("Thread led amarelo libera transition_mutex");
     }
 }
 
@@ -178,8 +197,9 @@ void thread_led_vermelho(void *a, void *b, void *c)
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
     const int RED_MS = 4000;
 
-    while (1) {
+    while (!modo_noturno) {
         k_sem_take(&sem_vermelho, K_FOREVER);
+        LOG_INF("Thread led vermelho consome sem_vermelho");
 
         gpio_pin_set_dt(&led2, 1);
         LOG_INF("RED ON");
@@ -190,9 +210,11 @@ void thread_led_vermelho(void *a, void *b, void *c)
 
         while (elapsed < RED_MS) {
             k_mutex_lock(&flags_mutex, K_FOREVER);
+            LOG_INF("Thread led vermelho pega flags_mutex");
             bool ped = ped_request;
             int64_t st = sync_timestamp_ms;
             k_mutex_unlock(&flags_mutex);
+            LOG_INF("Thread led vermelho libera flags_mutex");
 
             if (ped) {
                 /* marca que houve pedido durante vermelho — não limpia aqui */
@@ -200,8 +222,10 @@ void thread_led_vermelho(void *a, void *b, void *c)
             } else if (st != 0 && st >= red_start) {
                 /* curto recebido DURANTE este vermelho -> encurta */
                 k_mutex_lock(&flags_mutex, K_FOREVER);
+                LOG_INF("Thread led vermelho pega flags_mutex");
                 sync_timestamp_ms = 0;
                 k_mutex_unlock(&flags_mutex);
+                LOG_INF("Thread led vermelho libera flags_mutex");
 
                 LOG_INF("RED shortened by sync at %lld (red start %lld)", st, red_start);
                 break;
@@ -219,15 +243,19 @@ void thread_led_vermelho(void *a, void *b, void *c)
             bool got_end_sync = false;
             while (waited < 8000) { /* timeout 8s pra segurança */
                 k_mutex_lock(&flags_mutex, K_FOREVER);
+                LOG_INF("Thread led vermelho pega flags_mutex");
                 int64_t st = sync_timestamp_ms;
                 k_mutex_unlock(&flags_mutex);
+                LOG_INF("Thread led vermelho libera flags_mutex");
                 if (st != 0 && st >= red_start) {
                     /* consome sync */
                     k_mutex_lock(&flags_mutex, K_FOREVER);
+                    LOG_INF("Thread led vermelho pega flags_mutex");
                     sync_timestamp_ms = 0;
                     ped_request = false;
                     ped_request_ts = 0;
                     k_mutex_unlock(&flags_mutex);
+                    LOG_INF("Thread led vermelho libera flags_mutex");
                     got_end_sync = true;
                     LOG_INF("End-sync received at %lld, ped_request cleared", st);
                     break;
@@ -238,10 +266,12 @@ void thread_led_vermelho(void *a, void *b, void *c)
             if (!got_end_sync) {
                 /* timeout: limpa ped_request para não travar o ciclo */
                 k_mutex_lock(&flags_mutex, K_FOREVER);
+                LOG_INF("Thread led vermelho pega flags_mutex");
                 ped_request = false;
                 ped_request_ts = 0;
                 sync_timestamp_ms = 0;
                 k_mutex_unlock(&flags_mutex);
+                LOG_INF("Thread led vermelho libera flags_mutex");
                 LOG_WRN("Timeout waiting end-sync; forced clear ped_request");
             }
         } else {
@@ -255,10 +285,42 @@ void thread_led_vermelho(void *a, void *b, void *c)
 
         /* libera GREEN */
         k_mutex_lock(&transition_mutex, K_FOREVER);
+        LOG_INF("Thread led vermelho pega transition_mutex");
         k_sem_give(&sem_verde);
+        LOG_INF("Thread led vermelho fornece sem_verde");
         k_mutex_unlock(&transition_mutex);
+        LOG_INF("Thread led vermelho libera transition_mutex");
 
         LOG_INF("RED signaled GREEN");
+    }
+}
+
+void thread_modo_noturno(void *arg1, void *arg2, void *arg3) {
+    k_sem_take(&sem_modo_noturno, K_FOREVER);
+    LOG_INF("Pegou sem_modo_noturno");
+
+    k_mutex_lock(&flags_mutex, K_FOREVER);
+    LOG_INF("Thread modo_noturno pegou flags_mutex");
+
+    gpio_pin_set_dt(&led0, 0);
+    gpio_pin_set_dt(&led2, 0);
+    LOG_INF("Desliga Led");
+
+    k_mutex_unlock(&flags_mutex);
+    LOG_INF("Thread modo_noturno liberou flags_mutex");
+
+    while(1) {
+        k_mutex_lock(&flags_mutex, K_FOREVER);
+        LOG_INF("Thread modo_noturno pegou flags_mutex");
+
+        gpio_pin_toggle_dt(&led0);
+        gpio_pin_toggle_dt(&led2);
+        LOG_INF("Ligou/Desligou Led Amarelo");
+
+        k_mutex_unlock(&flags_mutex);
+        LOG_INF("Thread modo_noturno pegou flags_mutex");
+
+        k_msleep(1000);
     }
 }
 
@@ -266,9 +328,15 @@ K_THREAD_DEFINE(t_processa_sync, 512, thread_processa_sync, NULL, NULL, NULL, 5,
 K_THREAD_DEFINE(t_led_verde, 512, thread_led_verde, NULL, NULL, NULL, 6, 0, 0);
 K_THREAD_DEFINE(t_led_amarelo, 512, thread_led_amarelo, NULL, NULL, NULL, 6, 0, 0);
 K_THREAD_DEFINE(t_led_vermelho, 512, thread_led_vermelho, NULL, NULL, NULL, 6, 0, 0);
+K_THREAD_DEFINE(t_modo_noturno, 512, thread_modo_noturno, NULL, NULL, NULL, 6, 0, 0);
 
 void main(void)
 {
+    if (modo_noturno) {
+        k_sem_give(&sem_verde);
+        LOG_INF("Thread main fornece sem_modo_noturno");
+    }
+
     int rc;
     LOG_INF("Iniciando semáforo veículos (1 thread por LED, transições protegidas)");
 

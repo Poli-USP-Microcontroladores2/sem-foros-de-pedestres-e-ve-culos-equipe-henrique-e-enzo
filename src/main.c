@@ -1,6 +1,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(semaforo_pedestres, LOG_LEVEL_INF);
 
 // Botão na porta PTA16
 #define PORTA_NODE DT_NODELABEL(gpioa)
@@ -62,7 +65,7 @@ void enviar_sinal_sincronizacao(void) {
     gpio_pin_set_dt(&sync_signal, 1);
     k_msleep(100);   // pulso curto = sincronização
     gpio_pin_set_dt(&sync_signal, 0);
-    printk(">> Sinal de sincronização enviado\n");
+    LOG_INF(">> Sinal de sincronizacao enviado\n");
 }
 
 void enviar_sinal_travessia(void) {
@@ -70,7 +73,7 @@ void enviar_sinal_travessia(void) {
     gpio_pin_set_dt(&sync_signal, 1);
     k_msleep(500);   // pulso longo = travessia
     gpio_pin_set_dt(&sync_signal, 0);
-    printk(">> Sinal de travessia enviado\n");
+    LOG_INF(">> Sinal de travessia enviado\n");
 }
 
 // --- ISR DO BOTÃO ---
@@ -107,7 +110,7 @@ void fn_thread_led_verde(void *p1, void *p2, void *p3) {
 
         k_sem_take(&cycle_sem, K_FOREVER);  // espera ciclo verde
         estado_atual = VERDE;
-        printk(">>> VERDE LIGADO - 4s\n");
+        LOG_INF(">>> VERDE LIGADO\n");
         set_leds(false, true);
 
         /* registra início do verde para comparar com ped_request_ts do botão */
@@ -117,14 +120,14 @@ void fn_thread_led_verde(void *p1, void *p2, void *p3) {
         while (waited < TEMPO_DO_LED_VERDE_MS) {
             /* se pedestre pressionou DURANTE este verde (timestamp posterior ao green start) -> interrompe */
             if (pedestre_esperando && (ped_request_ts >= green_start)) {
-                printk(">>> VERDE interrompido por pedido de travessia (durante verde)\n");
+                LOG_INF(">>> VERDE interrompido por pedido de travessia (durante verde)\n");
                 break;
             }
             k_msleep(100);
             waited += 100;
         }
 
-        printk(">>> VERDE DESLIGADO\n");
+        LOG_INF(">>> VERDE DESLIGADO\n");
         set_leds(false, false);
         estado_atual = VERMELHO;
 
@@ -142,7 +145,7 @@ void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
 
         estado_atual = VERMELHO;
 
-        printk(">>> VERMELHO LIGADO\n");
+        LOG_INF(">>> VERMELHO LIGADO\n");
         set_leds(true, false);
 
         int espera = 0;
@@ -162,7 +165,7 @@ void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
         }
 
         if (pedido_detectado_durante_vermelho) {
-            printk(">>> Pedido de travessia recebido durante VERMELHO - enviando travessia (se necessário)\n");
+            LOG_INF(">>> Pedido de travessia recebido durante VERMELHO - enviando travessia (se necessário)\n");
             /* envia pulso de travessia (caso pedestre local precise avisar) */
             enviar_sinal_travessia();
             /* aguarda o tempo de travessia do pedestre terminar; o pedestre envia um pulso curto ao final
@@ -190,8 +193,10 @@ void fn_thread_led_noturno(void *p1, void *p2, void *p3) {
             continue;
         }
         set_leds(true, false);
+        LOG_INF("LED VERMELHO LIGADO");
         k_msleep(TEMPO_DO_PISCA_LED_VERMELHO_MS);
         set_leds(false, false);
+        LOG_INF("LED VERMELHO DESLIGADO");
         k_msleep(TEMPO_DO_PISCA_LED_VERMELHO_MS);
     }
 }
@@ -201,7 +206,7 @@ void toggle_modo_noturno(void) {
     modo_noturno_ativo = !modo_noturno_ativo;
 
     if (modo_noturno_ativo) {
-        printk("=== MODO NOTURNO ATIVADO ===\n");
+        LOG_INF("=== MODO NOTURNO ATIVADO ===\n");
         set_leds(false, false);
         if (tid_noturno == NULL) {
             tid_noturno = k_thread_create(&noturno_thread, noturno_stack,
@@ -209,28 +214,27 @@ void toggle_modo_noturno(void) {
                 NULL, NULL, NULL, 5, 0, K_NO_WAIT);
         }
     } else {
-        printk("=== MODO NORMAL ATIVADO ===\n");
+        LOG_INF("=== MODO NORMAL ATIVADO ===\n");
         set_leds(false, false);
     }
 }
 
 // --- MAIN ---
 void main(void) {
-    int noturno = 0;
-
-    printk("Iniciando semáforo de pedestres...\n");
+    bool modo_noturno = false;//true;   //modo noturno hard coded.
+    LOG_INF("Iniciando semáforo de pedestres...\n");
 
     // Valida hardware
     if (!gpio_is_ready_dt(&led_red) || !gpio_is_ready_dt(&led_green)) {
-        printk("Erro: LEDs não estão prontos\n");
+        LOG_INF("Erro: LEDs não estão prontos\n");
         return;
     }
     if (!device_is_ready(button.port)) {
-        printk("Erro: GPIOA não está pronto\n");
+        LOG_INF("Erro: GPIOA não está pronto\n");
         return;
     }
     if (!device_is_ready(sync_signal.port)) {
-        printk("Erro: GPIOB não está pronto\n");
+        LOG_INF("Erro: GPIOB não está pronto\n");
         return;
     }
 
@@ -252,10 +256,10 @@ void main(void) {
 
     set_leds(false, false);
 
-    if (noturno == 1) {
+    if (modo_noturno) {
         toggle_modo_noturno();
     } else {
-        printk("Modo normal ativado - ciclo 4s verde / 4s vermelho\n");
+        LOG_INF("Modo normal ativado - ciclo 4s verde / 4s vermelho\n");
 
         tid_red = k_thread_create(&red_thread, red_stack,
             K_THREAD_STACK_SIZEOF(red_stack), fn_thread_led_vermelho,
@@ -268,9 +272,10 @@ void main(void) {
             NULL, NULL, NULL, 5, 0, K_NO_WAIT);
     }
 
-    printk("Sistema iniciado - PTB1 como saída de sincronismo\n");
+    LOG_INF("Sistema iniciado - PTB1 como saída de sincronismo\n");
 
     enviar_sinal_travessia(); //POG para bootar o semaforo
+    k_msleep(1000);
 
     while (1) {
         k_msleep(10000);

@@ -221,7 +221,7 @@ void toggle_modo_noturno(void) {
 
 // --- MAIN ---
 void main(void) {
-    bool modo_noturno = false;//true;   //modo noturno hard coded.
+    bool modo_noturno = false;   //modo noturno hard coded.
     LOG_INF("Iniciando semáforo de pedestres...\n");
 
     // Valida hardware

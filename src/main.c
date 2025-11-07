@@ -174,6 +174,7 @@ void fn_thread_led_vermelho(void *p1, void *p2, void *p3) {
             k_msleep(1000); // mantém vermelho enquanto travessia acontece
         }
 
+        LOG_INF(">>> VERMELHO DESLIGADO\n");
         set_leds(false, false);
 
         /* envia sinal curto de sincronização para a placa veicular indicando fim do ciclo pedestre */
